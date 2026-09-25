@@ -16,6 +16,8 @@
 
 ## 运行
 
+> P1 使用 `chromadb@3.5.0`，请使用 Node.js 20+；P0 的基础聊天在 Node.js 18.18+ 可运行。
+
 ```bash
 npm install
 cp .env.example .env.local
