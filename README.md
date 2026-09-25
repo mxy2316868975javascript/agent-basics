@@ -4,7 +4,7 @@
 
 - `LLM`：服务端调用 OpenAI-compatible Chat Completions。
 - `Token`：页面展示输入文本的近似 Token 数，只用于理解计量概念。
-- `Embedding`：页面解释语义向量；本版本不接真实 Embedding API 或向量数据库。
+- `Embedding`：服务端调用 OpenAI-compatible `/embeddings`，为知识库片段生成真实向量。
 - `SSE`：模型最终回答通过服务端事件逐段返回浏览器。
 - `Function Calling`：询问当前时间时，模型请求 `get_current_time`，Node 执行后把结果交回模型。
 
@@ -27,7 +27,30 @@ cp .env.example .env.local
 npm run dev
 ```
 
-打开 <http://localhost:3000>。
+P1 知识库还需要先启动本地 Chroma：
+
+```bash
+docker compose up -d
+```
+
+然后打开：
+
+```text
+http://localhost:3000
+```
+
+上传 `.md` 或 `.txt` 文件，等待状态变为 `ready`，打开“使用知识库”后提问即可看到检索来源。
+
+### 环境变量
+
+| 变量 | 用途 | 默认值 |
+| --- | --- | --- |
+| `LLM_API_KEY` | 服务端调用 Chat Completions 和 Embedding | 无，必须填写 |
+| `LLM_BASE_URL` | OpenAI-compatible 服务地址 | `https://api.openai.com/v1` |
+| `LLM_MODEL` | 对话模型 | `gpt-4o-mini` |
+| `EMBEDDING_MODEL` | 向量模型 | `text-embedding-3-small` |
+| `CHROMA_URL` | 本地 Chroma 地址 | `http://localhost:8000` |
+| `CHROMA_COLLECTION` | Chroma collection 名称 | `ai_basics_demo_chunks` |
 
 ## 检查
 
@@ -40,7 +63,8 @@ npm run build
 
 ```text
 React 页面
-  -> POST /api/chat
+  -> POST /api/chat（可先检索 Chroma）
+  -> POST /api/knowledge/documents（上传时解析、Embedding、写入 Chroma）
   -> Node 首轮请求模型，判断是否需要工具
   -> Node 执行 get_current_time（如果被请求）
   -> Node 第二轮请求模型，并以 SSE 转发 token
@@ -48,3 +72,5 @@ React 页面
 ```
 
 模型 Key 只放在 Node 服务端环境变量中，不会发送到浏览器。
+
+P1 使用固定的 `demo-user` 演示 owner 过滤，文档元数据保存在 `data/knowledge/`，Chroma 数据保存在 `data/chroma/`，两者都不会提交到 Git。当前索引是同步处理，适合学习和单进程开发，不包含登录、队列、PDF/DOCX 解析或多实例协调。

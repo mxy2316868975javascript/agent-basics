@@ -1,6 +1,6 @@
 # P1：RAG 知识库
 
-状态：**规划中，当前 Demo 尚未实现**
+状态：**已实现，学习型版本**
 
 P1 的目标是让 AI 不只依赖模型训练时学到的内容，而是能够根据用户上传的私有文档回答问题，并且给出可追溯的来源。
 
@@ -23,16 +23,16 @@ RAG 的全称是 Retrieval-Augmented Generation，意思是“先检索资料，
 
 ## 2. P1 的目标能力
 
-| 能力 | 目标 |
+| 能力 | 当前实现 |
 | --- | --- |
-| 文档上传 | 接收 Markdown、TXT，后续扩展 PDF、DOCX |
-| 文本解析 | 提取正文和基础元数据 |
-| 文档分片 | 将长文档切成适合检索的小片段 |
-| Embedding | 为每个片段生成语义向量 |
-| 向量检索 | 根据问题找出最相关片段 |
-| 来源引用 | 返回文档名、章节或页码 |
-| 权限过滤 | 只检索当前用户有权访问的文档 |
-| RAG 对话 | 将检索结果交给 LLM 生成回答 |
+| 文档上传 | 已实现，仅接收 Markdown、TXT，单文件最大 1 MB |
+| 文本解析 | 已实现，统一换行、移除 BOM、保留原始文本 |
+| 文档分片 | 已实现，按标题/段落切分，最大约 1200 字符并保留重叠 |
+| Embedding | 已实现，服务端批量调用 OpenAI-compatible `/embeddings` |
+| 向量检索 | 已实现，本地 Chroma cosine Top-K，距离阈值 0.8 |
+| 来源引用 | 已实现，返回文档名、章节、片段序号和相似度 |
+| 权限过滤 | 已实现，所有本地列表和 Chroma 查询固定过滤 `demo-user` |
+| RAG 对话 | 已实现，检索结果通过 `retrieval` SSE 事件和 `[S1]` 来源进入页面 |
 
 P1 先解决“能找对资料并引用来源”，不在第一版加入 Agent、自主规划或复杂重排序。
 
@@ -169,9 +169,7 @@ P1 最小实现可以采用：
 
 模型说“资料里没有答案”时，不能自动用模型常识补一个看似合理的答案。
 
-## 8. 建议接口
-
-以下是 P1 的建议接口，不代表当前代码已经提供：
+## 8. 已实现接口
 
 | 接口 | 作用 |
 | --- | --- |
@@ -184,7 +182,84 @@ P1 最小实现可以采用：
 
 检索调试接口很重要。没有它时，回答错误只能看到最终文本，无法判断是分片错误、向量错误还是 Prompt 错误。
 
-## 9. 失败场景
+### 8.1 启动 Chroma
+
+```bash
+docker compose up -d
+curl http://localhost:8000/api/v2/heartbeat
+```
+
+`.env.local` 至少需要配置：
+
+```text
+LLM_API_KEY=your-key
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_MODEL=gpt-4o-mini
+EMBEDDING_MODEL=text-embedding-3-small
+CHROMA_URL=http://localhost:8000
+CHROMA_COLLECTION=ai_basics_demo_chunks
+```
+
+### 8.2 上传、检索和删除示例
+
+上传会同步完成解析、Embedding 和 Chroma 写入；只有全部成功才返回 `ready`。
+
+```bash
+curl -X POST http://localhost:3000/api/knowledge/documents \
+  -F 'file=@./refund-policy.md;type=text/markdown'
+
+curl http://localhost:3000/api/knowledge/documents
+
+curl -X POST http://localhost:3000/api/knowledge/search \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"退款期限是多久？","topK":5}'
+
+curl -X DELETE http://localhost:3000/api/knowledge/documents/doc_xxx
+```
+
+检索返回的 `score` 是 `1 - cosine distance`，只保留距离不超过 `0.8` 的片段。空结果是正常结果，表示没有足够相关的资料，不会把最低分片段强行交给模型。
+
+### 8.3 RAG 聊天和 SSE
+
+```bash
+curl -N -X POST http://localhost:3000/api/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"knowledgeBase":true,"messages":[{"role":"user","content":"退款期限是多久？"}]}'
+```
+
+响应为 `text/event-stream`，P1 在 P0 的 `meta`、`tool_call`、`tool_result`、`token`、`done`、`error` 之外增加：
+
+```text
+data: {"type":"retrieval","hits":[{"documentName":"refund-policy.md","sectionTitle":"退款规则","chunkIndex":0,"score":0.86}]}
+```
+
+没有命中时仍会发送 `retrieval`，但 `hits` 为空；系统 Prompt 会要求模型回答“知识库中没有足够资料”。将 `knowledgeBase` 设为 `false` 时，聊天回到 P0 的普通对话路径。
+
+## 9. 当前代码结构和生命周期
+
+| 文件 | 责任 |
+| --- | --- |
+| `lib/knowledge.ts` | 文件校验、哈希去重、索引编排、检索和 RAG Prompt |
+| `lib/chunking.ts` | Markdown/TXT 规范化和标题/段落分片 |
+| `lib/knowledge-store.ts` | 本地文档元数据、原文文件和原子写入 |
+| `lib/chroma.ts` | Chroma collection、owner 过滤、向量写入/检索/删除 |
+| `app/api/knowledge/documents/route.ts` | 上传和文档列表 |
+| `app/api/knowledge/documents/[id]/route.ts` | 文档详情和删除 |
+| `app/api/knowledge/search/route.ts` | 检索调试接口 |
+| `app/api/chat/route.ts` | RAG 检索、Prompt 拼装、Function Calling 和 SSE |
+| `components/knowledge-panel.tsx` | 上传、列表、状态和删除交互 |
+| `hooks/use-chat-stream.ts` | SSE 读取、消息状态和检索/工具轨迹 |
+
+索引生命周期是：
+
+```text
+校验文件 → SHA-256 查重 → processing → 分片 → 批量 Embedding → Chroma upsert → ready
+                                                        ↘ 任一步失败 → 清理向量 → failed
+```
+
+文档重复上传时按 `owner_id + content_hash` 复用已有记录。同名但内容不同的文件会生成不同文档 ID，能够在检索结果中区分。
+
+## 10. 失败场景
 
 | 场景 | 处理方式 |
 | --- | --- |
@@ -197,7 +272,7 @@ P1 最小实现可以采用：
 | 用户无权访问文档 | 检索前过滤，不向模型暴露片段 |
 | 删除文档 | 文档和所有片段必须一起失效或删除 |
 
-## 10. P1 常见业务坑
+## 11. P1 常见业务坑
 
 RAG 最容易出现的误判是：“模型回答错了，所以模型不行。”实际上很多错误发生在文档解析、分片、权限过滤和索引生命周期，而不是生成阶段。
 
@@ -212,11 +287,11 @@ RAG 最容易出现的误判是：“模型回答错了，所以模型不行。�
 | 没有命中资料时，模型用常识补答案 | 设置检索阈值；低于阈值时明确回答“知识库没有足够资料” | RAG 的价值是可追溯事实，不是让模型用更自信的语气继续猜 |
 | 引用显示了文档名，但引用内容没有支持答案 | 引用必须来自实际参与 Prompt 的片段，保存章节、页码和必要的原文摘录 | 只显示一个文件名不等于可验证来源，错误引用会让用户产生虚假信任 |
 | 同一个文件反复上传，产生重复向量和重复答案 | 使用文件哈希、版本号和幂等入库键；重复任务复用已有结果 | 重复索引会浪费 Embedding 成本，也会让检索结果重复、排序不稳定 |
-| 上传接口只检查扩展名 | 检查 MIME、文件头、大小、压缩包展开大小，并在服务端隔离解析 | 扩展名可以伪造，恶意文件或超大压缩包可能导致解析服务被攻击 |
-| 上传后同步等待全部解析完成 | 上传和索引拆成异步任务，返回任务状态和失败原因 | 大文件处理和 Embedding 调用耗时不可控，同步请求会超时并造成用户重复提交 |
+| 上传接口只检查扩展名 | 当前同时检查扩展名、允许的 MIME 和 1 MB 大小；扩展到 PDF/压缩包时再增加文件头和解析沙箱 | 扩展名可以伪造，解析能力扩大后恶意文件和资源消耗风险会增加 |
+| 把同步索引误当成生产方案 | 当前明确限制 1 MB 和单进程；生产改成队列、任务状态、幂等键和重试 | Embedding 和向量写入耗时不可控，同步请求容易超时并造成重复提交 |
 | 只拿几条“标准问题”评估效果 | 同时准备有答案、无答案、同义表达、跨文档和权限边界问题 | 真实用户不会只用文档标题里的原词提问，单一测试集会掩盖召回缺陷 |
 
-## 11. P1 验收标准
+## 12. P1 验收标准
 
 - 上传一个 Markdown 文档后，可以看到从 `processing` 到 `ready` 的状态变化。
 - 用户问题可以检索到相关片段。
@@ -226,6 +301,14 @@ RAG 最容易出现的误判是：“模型回答错了，所以模型不行。�
 - 检索调试接口可以独立查看 Top-K 片段。
 - 准备至少 20 条问题作为基础回归集，覆盖有答案、无答案和相似表达。
 
-## 12. 从 P0 到 P1 的新增边界
+## 13. 当前限制和升级方向
+
+- `demo-user` 只是演示 owner 过滤，不是登录或生产权限系统。
+- 元数据和原文在本地 JSON/文件目录，Chroma 使用本地持久化目录；不适合多实例同时写入。
+- 当前同步处理 Markdown/TXT，不支持 PDF、DOCX、OCR、表格结构恢复或异步队列。
+- 当前只用向量 Top-K 和阈值，没有混合检索、重排序、版本发布切换或评测集。
+- P2 再补充真实认证、任务队列、ACL、重排序、离线评测、成本统计和生产级观测。
+
+## 14. 从 P0 到 P1 的新增边界
 
 P0 的 `POST /api/chat` 只处理消息和工具调用；P1 会新增文档处理链路、向量存储和引用结构。不要把文档全文直接拼进 P0 Prompt，也不要在浏览器端保存 API Key、Embedding 向量或未过滤的私有文档。

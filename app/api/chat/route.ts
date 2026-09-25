@@ -1,4 +1,6 @@
 import { getModelName, getModelConfig, requestCompletion, streamCompletion, type ModelMessage } from "../../../lib/llm";
+import { buildKnowledgePrompt, searchKnowledge } from "../../../lib/knowledge";
+import type { KnowledgeHit } from "../../../lib/knowledge-types";
 import { approximateTokens } from "../../../lib/tokens";
 import { executeTool, GET_CURRENT_TIME_TOOL } from "../../../lib/tools";
 
@@ -11,6 +13,7 @@ type ClientMessage = { role: "user" | "assistant"; content: string };
 
 type ServerEvent =
   | { type: "meta"; model: string; approximateTokens: number }
+  | { type: "retrieval"; hits: Array<Omit<KnowledgeHit, "content" | "documentId"> & { documentId: string }> }
   | { type: "tool_call"; name: string; arguments: string }
   | { type: "tool_result"; name: string; result: Record<string, string>; ok: boolean }
   | { type: "token"; content: string }
@@ -22,9 +25,9 @@ const SYSTEM_PROMPT = `你是一个面向前端工程师的 AI 入门教练。
 如果用户询问当前时间、现在几点或今天日期，调用 get_current_time 工具后再回答。
 不要声称自己已经访问了没有提供的文件、数据库或网络数据。`;
 
-function validateMessages(value: unknown): ClientMessage[] {
+function validateRequest(value: unknown): { messages: ClientMessage[]; knowledgeBase: boolean } {
   if (!value || typeof value !== "object") throw new Error("请求格式不正确。");
-  const body = value as { messages?: unknown };
+  const body = value as { messages?: unknown; knowledgeBase?: unknown };
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     throw new Error("至少需要一条消息。");
   }
@@ -42,7 +45,7 @@ function validateMessages(value: unknown): ClientMessage[] {
   const latest = [...messages].reverse().find((message) => message.role === "user");
   if (!latest) throw new Error("至少需要一条用户消息。");
   if (latest.content.length > 4000) throw new Error("单次问题请控制在 4000 字以内。");
-  return messages;
+  return { messages, knowledgeBase: body.knowledgeBase === true };
 }
 
 function eventLine(event: ServerEvent) {
@@ -51,9 +54,12 @@ function eventLine(event: ServerEvent) {
 
 export async function POST(request: Request) {
   let messages: ClientMessage[];
+  let knowledgeBase = false;
 
   try {
-    messages = validateMessages(await request.json());
+    const validated = validateRequest(await request.json());
+    messages = validated.messages;
+    knowledgeBase = validated.knowledgeBase;
     getModelConfig();
   } catch (error) {
     return Response.json(
@@ -62,10 +68,6 @@ export async function POST(request: Request) {
     );
   }
 
-  const modelMessages: ModelMessage[] = [
-    { role: "system", content: SYSTEM_PROMPT },
-    ...messages,
-  ];
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
       let closed = false;
@@ -86,10 +88,24 @@ export async function POST(request: Request) {
             approximateTokens: approximateTokens(messages.map((message) => message.content).join("\n")),
           });
 
-          const first = await requestCompletion(modelMessages, [GET_CURRENT_TIME_TOOL], request.signal);
+          let knowledgeHits: KnowledgeHit[] = [];
+          if (knowledgeBase) {
+            const latestUserMessage = [...messages].reverse().find((message) => message.role === "user");
+            knowledgeHits = latestUserMessage ? await searchKnowledge(latestUserMessage.content) : [];
+            send({
+              type: "retrieval",
+              hits: knowledgeHits.map(({ content: _content, ...hit }) => hit),
+            });
+          }
+
+          const prompt = knowledgeBase
+            ? `${SYSTEM_PROMPT}\n${buildKnowledgePrompt(knowledgeHits)}`
+            : SYSTEM_PROMPT;
+          const ragMessages: ModelMessage[] = [{ role: "system", content: prompt }, ...messages];
+          const first = await requestCompletion(ragMessages, [GET_CURRENT_TIME_TOOL], request.signal);
           const assistant = first.choices?.[0]?.message;
           const toolCalls = assistant?.tool_calls ?? [];
-          const followUpMessages: ModelMessage[] = [...modelMessages];
+          const followUpMessages: ModelMessage[] = [...ragMessages];
 
           if (toolCalls.length > 0) {
             followUpMessages.push({

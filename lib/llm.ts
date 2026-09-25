@@ -18,6 +18,10 @@ type CompletionResponse = {
   }>;
 };
 
+type EmbeddingResponse = {
+  data?: Array<{ embedding?: number[]; index?: number }>;
+};
+
 type ChatChunk = {
   choices?: Array<{ delta?: { content?: string | null } }>;
 };
@@ -86,6 +90,39 @@ async function postCompletion(
 async function readProviderError(response: Response) {
   const detail = (await response.text()).slice(0, 300);
   return `模型服务返回 ${response.status}: ${detail || "无错误详情"}`;
+}
+
+export async function requestEmbeddings(texts: string[], signal?: AbortSignal): Promise<number[][]> {
+  if (texts.length === 0) return [];
+
+  const config = getModelConfig();
+  const requestSignal = createRequestSignal(signal, 90_000);
+
+  try {
+    const response = await fetch(`${config.baseUrl}/embeddings`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ model: process.env.EMBEDDING_MODEL || "text-embedding-3-small", input: texts }),
+      signal: requestSignal.signal,
+    });
+
+    if (!response.ok) throw new Error(await readProviderError(response));
+    const payload = (await response.json()) as EmbeddingResponse;
+    const embeddings = [...(payload.data ?? [])]
+      .sort((left, right) => (left.index ?? 0) - (right.index ?? 0))
+      .map((item) => item.embedding);
+
+    if (embeddings.length !== texts.length || embeddings.some((embedding) => !embedding?.length)) {
+      throw new Error("Embedding 服务返回的数据不完整。");
+    }
+
+    return embeddings as number[][];
+  } finally {
+    requestSignal.cleanup();
+  }
 }
 
 export async function requestCompletion(
